@@ -1,0 +1,4 @@
+*.ja.html
+*.ja.cache.json
+*.pdf
+__pycache__/
