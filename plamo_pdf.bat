@@ -1,12 +1,21 @@
 @echo off
 rem Drag and drop PDF files onto this file to make bilingual HTML and open it.
-rem Choose the model below: 8b (best quality, ~6.5 GB VRAM) or 0.8b (light, ~1 GB VRAM)
+rem Run setup.bat once first. The model chosen there is read from model.txt.
+rem To change it, edit model.txt (8b or 0.8b) or run setup.bat again.
+setlocal
 set MODEL=8b
+if exist "%~dp0model.txt" set /p MODEL=<"%~dp0model.txt"
 
 chcp 65001 >nul
-set "PY=python"
-if exist "%~dp0.venv\Scripts\python.exe" set "PY=%~dp0.venv\Scripts\python.exe"
-
-"%PY%" -c "import pymupdf" 2>nul || "%PY%" -m pip install -r "%~dp0requirements.txt"
-"%PY%" "%~dp0plamo_pdf.py" --model %MODEL% --open %*
+if not exist "%~dp0.venv\Scripts\python.exe" (
+  echo Please run setup.bat first.
+  pause
+  exit /b 1
+)
+if "%~1"=="" (
+  echo Drag and drop PDF files onto plamo_pdf.bat.
+  pause
+  exit /b 1
+)
+"%~dp0.venv\Scripts\python.exe" "%~dp0plamo_pdf.py" --model %MODEL% --open %*
 pause

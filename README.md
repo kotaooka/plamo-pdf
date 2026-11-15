@@ -35,21 +35,29 @@
 
 ## 使い方
 
-### 1. 準備
+### 1. セットアップ（初回のみ）
 
-```powershell
-pip install -r requirements.txt
-```
+[Python 3.10 以上](https://www.python.org/downloads/)を入れてから、**`setup.bat` をダブルクリック**し、使うモデル（8b / 0.8b / 両方）を選ぶ。次のことを自動で行い、最後に1文だけ翻訳して動作を確かめる。
 
-llama-server は次の順に自動で探す。どれも無ければ [llama.cpp の Releases](https://github.com/ggml-org/llama.cpp/releases) から `llama-*-bin-win-cuda-*-x64.zip` と対応する `cudart-*.zip` を取得して同じフォルダに展開し、`--server` か環境変数 `LLAMA_SERVER` でそのパスを指定する。
+1. `.venv` を作って `pymupdf` を入れる
+2. llama-server を探し、無ければ [llama.cpp の公式リリース](https://github.com/ggml-org/llama.cpp/releases)から Windows 版を取ってきて `%USERPROFILE%\.cache\plamo-pdf\llama.cpp\` に展開する（NVIDIA GPU があれば CUDA 12.4 版＋cudart、約 710 MB。無ければ Vulkan 版）
+3. 選んだモデルをダウンロードする（既にあれば使う）
+4. 選んだモデルを `model.txt` に保存する（`plamo_pdf.bat` が使う。両方選んだときは 8b）
+
+`setup.bat 0.8b` のように引数でモデルを渡すと、選択画面を出さずに進む。
+
+llama-server は次の順に探す。
 
 1. `--server` / 環境変数 `LLAMA_SERVER`
 2. `PATH` 上の `llama-server`
-3. LM Studio に同梱の llama.cpp（`%USERPROFILE%\.lmstudio\extensions\backends\`。CUDA版・新しい版を優先）
+3. `setup.bat` が入れた llama.cpp（`%USERPROFILE%\.cache\plamo-pdf\llama.cpp\`）
+4. LM Studio に同梱の llama.cpp（`%USERPROFILE%\.lmstudio\extensions\backends\`。CUDA版・新しい版を優先）
+
+Windows 以外では `pip install -r requirements.txt` を実行し、llama.cpp を入れて `--server` で指定する。
 
 ### 2. 翻訳する
 
-**いちばん簡単な方法**：PDF を `plamo_pdf.bat` にドラッグ＆ドロップする（複数可）。終わると対訳HTMLがブラウザで開く。モデルは bat 先頭の `set MODEL=8b` で切り替える。
+**いちばん簡単な方法**：PDF を `plamo_pdf.bat` にドラッグ＆ドロップする（複数可）。終わると対訳HTMLがブラウザで開く。モデルを変えるときは `model.txt` を `8b` か `0.8b` に書き換えるか、`setup.bat` をもう一度実行する。
 
 コマンドから使う場合：
 
@@ -65,6 +73,7 @@ python plamo_pdf.py a.pdf b.pdf --form polite --open
 
 | オプション | 既定 | 内容 |
 |---|---|---|
+| `--setup` | なし | llama-server（無ければ自動で入れる）とモデルを用意し、1文訳して動作確認する |
 | `--model` | `8b` | `8b` / `0.8b` / `.gguf` ファイルのパス |
 | `--server` | 自動検出 | llama-server 実行ファイル（またはそのフォルダ）のパス |
 | `--gpu-layers` | `99` | GPU に載せる層数（VRAM 不足なら減らす） |
@@ -83,6 +92,7 @@ python plamo_pdf.py a.pdf b.pdf --form polite --open
 ## 状態
 
 - Physical Review E の2段組論文（7ページ）で、8B・0.8B ともに実モデルで動作確認済み（RTX 3070 8 GB）
+- `setup.bat` は、llama.cpp もモデルも無い状態から（llama.cpp b12407 CUDA 版・0.8B）セットアップ→翻訳まで確認済み
 - 既知の制限：段・ページをまたぐ段落は2つに分かれて訳される
 
 ## モデルのライセンス

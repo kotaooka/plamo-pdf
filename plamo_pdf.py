@@ -242,19 +242,23 @@ def write_html(out: Path, title: str, items):
 
 # ---------------------------------------------------------------- llama-server の用意
 def find_server(explicit: str | None) -> Path | None:
-    """llama-server を探す: --server → 環境変数 LLAMA_SERVER → PATH → LM Studio 同梱版（CUDA 優先・新しい順）"""
+    """llama-server を探す: --server → 環境変数 LLAMA_SERVER → PATH → --setup で入れた版
+    → LM Studio 同梱版（CUDA 優先・新しい順）"""
+    exe = "llama-server.exe" if os.name == "nt" else "llama-server"
     for c in (explicit, os.environ.get("LLAMA_SERVER")):
         if c:
             p = Path(c)
             if p.is_dir():
-                p = p / ("llama-server.exe" if os.name == "nt" else "llama-server")
+                p = p / exe
             return p if p.exists() else None
     w = shutil.which("llama-server")
     if w:
         return Path(w)
+    own = list((MODELS_DIR / "llama.cpp").glob(f"b*/{exe}"))
+    if own:
+        return max(own, key=lambda p: int(re.sub(r"\D", "", p.parent.name) or 0))
     backends = Path.home() / ".lmstudio" / "extensions" / "backends"
     if backends.is_dir():
-        exe = "llama-server.exe" if os.name == "nt" else "llama-server"
         found = [p for p in backends.glob(f"llama.cpp-*/{exe}")]
 
         def rank(p):
@@ -413,11 +417,75 @@ def translate_pdf(pdf: Path, a, model_tag: str) -> Path:
     return out
 
 
+def install_llama_cpp(dest_root: Path = None) -> Path:
+    """llama.cpp の公式リリース（GitHub）から Windows 版を取ってきて展開する。
+    NVIDIA GPU があれば CUDA 12.4 版（+ cudart）、無ければ Vulkan 版。"""
+    if os.name != "nt":
+        sys.exit("自動インストールは Windows のみ対応です。llama.cpp を入れて --server で指定してください。")
+    dest_root = dest_root or MODELS_DIR / "llama.cpp"
+    rels = http_json("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10", timeout=30)
+    nvidia = shutil.which("nvidia-smi") is not None
+    for rel in rels:
+        if not re.fullmatch(r"b\d+", rel["tag_name"]):
+            continue
+        assets = {x["name"]: x["browser_download_url"] for x in rel["assets"]}
+        tag = rel["tag_name"]
+        if nvidia:
+            want = [f"llama-{tag}-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip"]
+        else:
+            want = [f"llama-{tag}-bin-win-vulkan-x64.zip"]
+        if all(w in assets for w in want):
+            break
+    else:
+        sys.exit("llama.cpp のリリースに必要なファイルが見つかりませんでした。手動で入れてください（README 参照）。")
+
+    import zipfile
+    dest = dest_root / tag
+    print(f"llama.cpp {tag}（{'CUDA 12.4' if nvidia else 'Vulkan'} 版）をダウンロードします → {dest}")
+    for name in want:
+        z = dest_root / name
+        download(assets[name], z)
+        with zipfile.ZipFile(z) as zf:
+            zf.extractall(dest)
+        z.unlink()
+    exe = next(dest.rglob("llama-server.exe"), None)
+    if not exe:
+        sys.exit(f"展開したフォルダに llama-server.exe がありません: {dest}")
+    if exe.parent != dest:  # zip 内にフォルダがある場合に備えて cudart の DLL を同じ場所へ
+        for dll in dest.glob("*.dll"):
+            dll.replace(exe.parent / dll.name)
+    return exe
+
+
+def setup(a):
+    """llama-server とモデルを用意し、1文だけ訳して動作を確かめる"""
+    exe = find_server(a.server)
+    if exe:
+        print(f"llama-server: {exe}")
+    else:
+        exe = install_llama_cpp()
+        print(f"llama-server: {exe}")
+    a.server = str(exe)
+    model = resolve_model(a.model or DEFAULT_MODEL)
+    print(f"モデル: {model}")
+    print("動作確認として1文だけ翻訳します…")
+    server = Server(a)
+    try:
+        tr = Translator(a.url, a.to, a.src or None, a.form, False, a.timeout)
+        src = "This tool translates research papers on your own PC."
+        print(f"  {src}\n  → {tr(src)}")
+    finally:
+        server.close()
+    print("セットアップ完了")
+
+
 def main():
     for s in (sys.stdout, sys.stderr):  # cp932 のコンソールで表示できない文字があっても落ちないように
         s.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description="PLaMo 3 Translate で論文PDFを対訳HTMLにする")
-    ap.add_argument("pdf", type=Path, nargs="+", help="翻訳するPDF（複数可）")
+    ap.add_argument("pdf", type=Path, nargs="*", help="翻訳するPDF（複数可）")
+    ap.add_argument("--setup", action="store_true",
+                    help="llama-server（無ければ自動で入れる）とモデルを用意して動作確認する")
     ap.add_argument("--model", default=None,
                     help=f"使うモデル: {' / '.join(MODELS)} または .gguf のパス（既定 {DEFAULT_MODEL}）")
     ap.add_argument("--url", default="http://127.0.0.1:8000", help="llama-server のURL")
@@ -434,6 +502,12 @@ def main():
     ap.add_argument("--open", action="store_true", help="終わったら対訳HTMLをブラウザで開く")
     a = ap.parse_args()
 
+    if a.setup:
+        setup(a)
+        return
+    if not a.pdf:
+        ap.print_usage()
+        sys.exit("翻訳するPDFを指定してください（Windows では PDF を plamo_pdf.bat にドラッグ＆ドロップ）。")
     for p in a.pdf:
         if not p.exists():
             sys.exit(f"ファイルがありません: {p}")
