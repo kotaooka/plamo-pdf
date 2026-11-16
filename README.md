@@ -98,3 +98,9 @@ python plamo_pdf.py a.pdf b.pdf --form polite --open
 ## モデルのライセンス
 
 PLaMo 3 Translate は PLaMo コミュニティライセンス。個人・非商用は登録不要で無償。詳細は [モデルカード](https://huggingface.co/pfnet/plamo-3-translate-8b) を参照。
+
+## ライセンス
+
+このリポジトリのコードは [MIT License](LICENSE)。
+
+PDF の読み取りに使う [PyMuPDF](https://github.com/pymupdf/PyMuPDF) は AGPL-3.0（または商用ライセンス）。このリポジトリには同梱せず、`setup.bat` で各自の環境に入れる。
