@@ -89,6 +89,20 @@ class Para(NamedTuple):
     bold: bool        # 太字が主か
     horizontal: bool  # すべての行が横書き（回転していない）か
     center: bool      # ページ中央にそろえた1〜2行のブロック（タイトルなど）か
+    table: bool       # 表の行（同じ高さに4つ以上の行が横に並ぶ）か。訳さない
+
+
+def is_table_row(lines) -> bool:
+    """同じ高さに4つ以上の行が横に並んでいれば、表の見出し行・データ行とみなす。
+    （MuPDF は表のセルを別々の行として取り出す。節番号＋見出しや「Encoder: 本文」は2つまで）"""
+    boxes = [line["bbox"] for line in lines]
+    for a in boxes:
+        h = a[3] - a[1]
+        side = sum(1 for b in boxes
+                   if min(a[3], b[3]) - max(a[1], b[1]) > 0.5 * min(h, b[3] - b[1]))
+        if side >= 4:
+            return True
+    return False
 
 
 def block_style(d: dict, page_width: float):
@@ -104,12 +118,12 @@ def block_style(d: dict, page_width: float):
             color[s["color"]] += n
             bold[bool(s["flags"] & 16) or "bold" in s["font"].lower()] += n
     if not size:
-        return 10.0, "#000000", False, horizontal, False
+        return 10.0, "#000000", False, horizontal, False, False
     x0, _, x1, _ = d["bbox"]
     center = (len(d["lines"]) <= 2 and abs((x0 + x1) / 2 - page_width / 2) < page_width * 0.02
               and x1 - x0 < page_width * 0.8)
     return (size.most_common(1)[0][0], f"#{color.most_common(1)[0][0]:06x}",
-            bold.most_common(1)[0][0], horizontal, center)
+            bold.most_common(1)[0][0], horizontal, center, is_table_row(d["lines"]))
 
 
 def extract_blocks(pdf_path: Path, keep_refs: bool):
@@ -286,6 +300,11 @@ def write_html(out: Path, title: str, items):
 # Windows 標準の日本語フォント（上ほど優先）。本文は明朝、太字の見出しはゴシックにする
 BODY_FONTS = ["BIZ-UDMinchoM.ttc", "yumin.ttf", "msmincho.ttc"]
 BOLD_FONTS = ["BIZ-UDGothicB.ttc", "YuGothB.ttc", "meiryob.ttc", "BIZ-UDGothicR.ttc", "msgothic.ttc"]
+# 英数字用の欧文フォント。BIZ UD明朝などは英数字が等幅で、論文中の英単語・数値が間延びするため
+LATIN_FONTS = ["times.ttf"]
+LATIN_BOLD_FONTS = ["arialbd.ttf", "timesbd.ttf"]
+# 欧文フォントで組む部分（英数字・記号・ラテン拡張・ギリシャ文字の並び。間の半角スペースも含める）
+LATIN_RUN = re.compile(r"[\x21-\x7eÀ-ɏͰ-Ͽ]+(?: +[\x21-\x7eÀ-ɏͰ-Ͽ]+)*")
 
 
 def font_dirs():
@@ -313,13 +332,16 @@ class PdfFonts:
             if not p.exists():
                 sys.exit(f"--pdf-font のフォントファイルがありません: {p}")
             body = bold = p
+            latin = latin_bold = None  # 指定されたフォントで英数字も組む
         else:
             body, bold = find_font(BODY_FONTS), find_font(BOLD_FONTS)
             bold = bold or body
+            latin, latin_bold = find_font(LATIN_FONTS), find_font(LATIN_BOLD_FONTS)
         self.archive = pymupdf.Archive()
         css = []
         added = set()
-        for fam, f in (("jbody", body), ("jbold", bold)):
+        self.has_latin, self.has_latin_bold = latin is not None, latin_bold is not None
+        for fam, f in (("jbody", body), ("jbold", bold), ("lbody", latin), ("lbold", latin_bold)):
             if f:
                 if f.parent not in added:
                     self.archive.add(str(f.parent))
@@ -332,13 +354,22 @@ class PdfFonts:
 
     def html(self, p: Para, text: str) -> str:
         fam = "jbold" if p.bold and self.has_bold else "jbody" if self.has_body else None
+        # 両端揃えは半角スペースだけを広げるので、和文では英単語の前後が大きく空く。左揃えにする
         style = [f"font-size:{p.size:.2f}pt", f"color:{p.color}", "line-height:1.25", "margin:0",
-                 "text-align:" + ("center" if p.center else "justify")]
+                 "text-align:" + ("center" if p.center else "left")]
         if fam:
             style.append(f"font-family:{fam}")
         if p.bold and (fam != "jbold" or self.bold_is_body):
             style.append("font-weight:bold")
-        return f"<p style='{';'.join(style)}'>{html.escape(text)}</p>"
+        lfam = ("lbold" if self.has_latin_bold else None) if fam == "jbold" else (
+            "lbody" if self.has_latin else None)
+        if lfam:
+            # 英数字の並びだけ欧文フォントにする（MuPDF は CSS の font-family を字ごとに切り替えないため span で分ける）
+            body = LATIN_RUN.sub(lambda m: f"\0{m.group(0)}\1", text)
+            body = html.escape(body).replace("\0", f"<span style='font-family:{lfam}'>").replace("\1", "</span>")
+        else:
+            body = html.escape(text)
+        return f"<p style='{';'.join(style)}'>{body}</p>"
 
 
 def page_obstacles(page) -> list:
@@ -629,7 +660,7 @@ def translate_pdf(pdf: Path, a, model_tag: str, fonts: "PdfFonts | None") -> lis
             for p in paras:
                 text = p.text
                 done += 1
-                if not should_translate(text):
+                if p.table or not should_translate(text):
                     items.append((pno, p, None))
                     continue
                 key = f"{model_tag}|{a.to}|{a.form}|{text}"  # モデル・訳先言語・文体が変わったら訳し直す
