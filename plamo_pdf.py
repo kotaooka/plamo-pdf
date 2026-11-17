@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-plamo_pdf.py — 論文PDFをローカルの PLaMo 3 Translate（llama-server）で対訳HTMLにする
+plamo_pdf.py — 論文PDFをローカルの PLaMo 3 Translate（llama-server）で翻訳し、
+               対訳HTML と 元のレイアウトのまま訳文に置き換えたPDF にする
 
 前提:
   pip install -r requirements.txt   （pymupdf）
@@ -10,11 +11,15 @@ plamo_pdf.py — 論文PDFをローカルの PLaMo 3 Translate（llama-server）
   python plamo_pdf.py paper.pdf                    # 8B で翻訳（サーバーとモデルは自動で用意）
   python plamo_pdf.py paper.pdf --model 0.8b       # 軽量モデル（VRAM 2 GB 程度で動く）
   python plamo_pdf.py a.pdf b.pdf --form polite --open
-  → paper.ja.html（対訳）と paper.ja.cache.json（途中再開用）ができる
+  python plamo_pdf.py paper.pdf -o D:\\翻訳 --format pdf,dual
+  → paper.ja.html（対訳）・paper.ja.pdf（レイアウト維持）・paper.ja.cache.json（途中再開用）ができる
+  出力先・出力形式などの既定値は config.ini で変えられる（python plamo_pdf.py --choose-out-dir）
 """
 
 import argparse
+import configparser
 import html
+import io
 import json
 import os
 import re
@@ -28,6 +33,7 @@ import urllib.request
 import urllib.error
 from collections import Counter
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     import pymupdf  # PyMuPDF
@@ -74,19 +80,69 @@ def reading_order(blocks, width):
 
 
 # ---------------------------------------------------------------- PDF抽出
+class Para(NamedTuple):
+    """1段落（= PDF の1テキストブロック）。レイアウト置き換え用に位置と書式も持つ"""
+    text: str
+    rect: tuple       # (x0, y0, x1, y1) [pt]
+    size: float       # 主な文字サイズ [pt]
+    color: str        # 主な文字色 "#rrggbb"
+    bold: bool        # 太字が主か
+    horizontal: bool  # すべての行が横書き（回転していない）か
+    center: bool      # ページ中央にそろえた1〜2行のブロック（タイトルなど）か
+    table: bool       # 表の行（同じ高さに4つ以上の行が横に並ぶ）か。訳さない
+
+
+def is_table_row(lines) -> bool:
+    """同じ高さに4つ以上の行が横に並んでいれば、表の見出し行・データ行とみなす。
+    （MuPDF は表のセルを別々の行として取り出す。節番号＋見出しや「Encoder: 本文」は2つまで）"""
+    boxes = [line["bbox"] for line in lines]
+    for a in boxes:
+        h = a[3] - a[1]
+        side = sum(1 for b in boxes
+                   if min(a[3], b[3]) - max(a[1], b[1]) > 0.5 * min(h, b[3] - b[1]))
+        if side >= 4:
+            return True
+    return False
+
+
+def block_style(d: dict, page_width: float):
+    """dict 形式のブロックから、文字数で重み付けした主な文字サイズ・色・太字を求める"""
+    size, color, bold = Counter(), Counter(), Counter()
+    horizontal = True
+    for line in d.get("lines", []):
+        if abs(line["dir"][0] - 1) > 1e-3:
+            horizontal = False
+        for s in line["spans"]:
+            n = len(s["text"].strip())
+            size[round(s["size"], 1)] += n
+            color[s["color"]] += n
+            bold[bool(s["flags"] & 16) or "bold" in s["font"].lower()] += n
+    if not size:
+        return 10.0, "#000000", False, horizontal, False, False
+    x0, _, x1, _ = d["bbox"]
+    center = (len(d["lines"]) <= 2 and abs((x0 + x1) / 2 - page_width / 2) < page_width * 0.02
+              and x1 - x0 < page_width * 0.8)
+    return (size.most_common(1)[0][0], f"#{color.most_common(1)[0][0]:06x}",
+            bold.most_common(1)[0][0], horizontal, center, is_table_row(d["lines"]))
+
+
 def extract_blocks(pdf_path: Path, keep_refs: bool):
-    """ページごとにテキストブロックを取り出し、段落単位に整える"""
+    """ページごとにテキストブロックを取り出し、段落単位に整える。
+    戻り値は (ページ番号, [Para, ...]) の列"""
     doc = pymupdf.open(pdf_path)
     pages = []
     for page in doc:
-        h = page.rect.height
+        h, w = page.rect.height, page.rect.width
+        tp = page.get_textpage()  # 同じ TextPage から取ると blocks と dict のブロック番号が一致する
+        styles = {d["number"]: d for d in page.get_text("dict", textpage=tp)["blocks"] if d["type"] == 0}
         blocks = []
-        for b, col in reading_order(page.get_text("blocks"), page.rect.width):
+        for b, col in reading_order(page.get_text("blocks", textpage=tp), w):
             if b[6] != 0:  # 画像ブロックは除外
                 continue
             # ページ上下 8% にあるブロックはヘッダー・フッター候補
             edge = b[3] < h * 0.08 or b[1] > h * 0.92
-            blocks.append((b[4], edge, b[1], col))
+            style = block_style(styles.get(b[5], {}), w)
+            blocks.append((b[4], edge, b[1], col, (b[0], b[1], b[2], b[3]), style))
         pages.append(blocks)
 
     # 上下端で全ページ的に繰り返すヘッダー・フッター（ページ番号含む）を除去
@@ -99,26 +155,26 @@ def extract_blocks(pdf_path: Path, keep_refs: bool):
     result = []
     for pno, blks in enumerate(pages, 1):
         items = []
-        for t, edge, y0, col in blks:
+        for t, edge, y0, col, rect, style in blks:
             if edge and (cnt[norm(t)] >= th or re.fullmatch(r"\s*\d{1,4}\s*", t)):
                 continue
             text = clean(t)
             if text:
-                items.append((text, y0, col))
+                items.append((text, y0, col, Para(text, rect, *style)))
         # 参考文献の開始位置を探す。そこから下で、同じ段かそれより後ろの段にあるブロックは文献とみなす。
         # （左段の途中から始まる場合: 両段とも下は文献。右段から始まる場合: 左段は本文のまま）
         ref = None
         if not keep_refs:
-            ref = next(((y0, col) for text, y0, col in items
+            ref = next(((y0, col) for text, y0, col, _ in items
                         if REF_HEAD.match(text) or REF_FIRST.match(text)), None)
         if ref:
             # 後ろの段では、文献番号で始まるブロック（"[10] L. Evans, ..."）が開始位置より上にあればそこから切る
             cut = {ref[1]: ref[0]}
-            for text, y0, col in items:
+            for text, y0, col, _ in items:
                 if col > ref[1] and REF_ITEM.match(text):
                     cut[col] = min(cut.get(col, ref[0]), y0)
             items = [it for it in items if not (it[2] >= ref[1] and it[1] >= cut.get(it[2], ref[0]))]
-        result.append((pno, [text for text, _, _ in items]))
+        result.append((pno, [p for _, _, _, p in items]))
         if ref:
             break
     return result
@@ -238,6 +294,179 @@ def write_html(out: Path, title: str, items):
             parts.append(f"<div class='p'><div class='src'>{s}</div><div class='dst'>{html.escape(dst)}</div></div>")
     parts.append(f"</main><script>{JS}</script></body></html>")
     out.write_text("".join(parts), encoding="utf-8")
+
+
+# ---------------------------------------------------------------- PDF出力（元のレイアウトのまま置き換え）
+# Windows 標準の日本語フォント（上ほど優先）。本文は明朝、太字の見出しはゴシックにする
+BODY_FONTS = ["BIZ-UDMinchoM.ttc", "yumin.ttf", "msmincho.ttc"]
+BOLD_FONTS = ["BIZ-UDGothicB.ttc", "YuGothB.ttc", "meiryob.ttc", "BIZ-UDGothicR.ttc", "msgothic.ttc"]
+# 英数字用の欧文フォント。BIZ UD明朝などは英数字が等幅で、論文中の英単語・数値が間延びするため
+LATIN_FONTS = ["times.ttf"]
+LATIN_BOLD_FONTS = ["arialbd.ttf", "timesbd.ttf"]
+# 欧文フォントで組む部分（英数字・記号・ラテン拡張・ギリシャ文字の並び。間の半角スペースも含める）
+LATIN_RUN = re.compile(r"[\x21-\x7eÀ-ɏͰ-Ͽ]+(?: +[\x21-\x7eÀ-ɏͰ-Ͽ]+)*")
+
+
+def font_dirs():
+    dirs = [Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"]
+    if os.environ.get("LOCALAPPDATA"):
+        dirs.append(Path(os.environ["LOCALAPPDATA"]) / "Microsoft" / "Windows" / "Fonts")
+    return dirs
+
+
+def find_font(names) -> Path | None:
+    for d in font_dirs():
+        for n in names:
+            if (d / n).exists():
+                return d / n
+    return None
+
+
+class PdfFonts:
+    """insert_htmlbox に渡す CSS とフォント置き場（Archive）。
+    フォントが見つからなければ PyMuPDF 内蔵の CJK フォント（Droid Sans Fallback）を使う"""
+
+    def __init__(self, explicit: str | None):
+        if explicit:
+            p = Path(explicit).expanduser()
+            if not p.exists():
+                sys.exit(f"--pdf-font のフォントファイルがありません: {p}")
+            body = bold = p
+            latin = latin_bold = None  # 指定されたフォントで英数字も組む
+        else:
+            body, bold = find_font(BODY_FONTS), find_font(BOLD_FONTS)
+            bold = bold or body
+            latin, latin_bold = find_font(LATIN_FONTS), find_font(LATIN_BOLD_FONTS)
+        self.archive = pymupdf.Archive()
+        css = []
+        added = set()
+        self.has_latin, self.has_latin_bold = latin is not None, latin_bold is not None
+        for fam, f in (("jbody", body), ("jbold", bold), ("lbody", latin), ("lbold", latin_bold)):
+            if f:
+                if f.parent not in added:
+                    self.archive.add(str(f.parent))
+                    added.add(f.parent)
+                css.append(f"@font-face{{font-family:{fam};src:url({f.name})}}")
+        self.has_body, self.has_bold = body is not None, bold is not None
+        self.bold_is_body = bold == body  # 太字用の書体が無い → font-weight で太らせる
+        self.css = "".join(css)
+        self.name = body.name if body else "PyMuPDF 内蔵フォント"
+
+    def html(self, p: Para, text: str) -> str:
+        fam = "jbold" if p.bold and self.has_bold else "jbody" if self.has_body else None
+        # 両端揃えは半角スペースだけを広げるので、和文では英単語の前後が大きく空く。左揃えにする
+        style = [f"font-size:{p.size:.2f}pt", f"color:{p.color}", "line-height:1.25", "margin:0",
+                 "text-align:" + ("center" if p.center else "left")]
+        if fam:
+            style.append(f"font-family:{fam}")
+        if p.bold and (fam != "jbold" or self.bold_is_body):
+            style.append("font-weight:bold")
+        lfam = ("lbold" if self.has_latin_bold else None) if fam == "jbold" else (
+            "lbody" if self.has_latin else None)
+        if lfam:
+            # 英数字の並びだけ欧文フォントにする（MuPDF は CSS の font-family を字ごとに切り替えないため span で分ける）
+            body = LATIN_RUN.sub(lambda m: f"\0{m.group(0)}\1", text)
+            body = html.escape(body).replace("\0", f"<span style='font-family:{lfam}'>").replace("\1", "</span>")
+        else:
+            body = html.escape(text)
+        return f"<p style='{';'.join(style)}'>{body}</p>"
+
+
+def page_obstacles(page) -> list:
+    """訳文の枠を伸ばすときにぶつかってはいけないもの（元の文字ブロック・画像・線画）の矩形"""
+    rects = [pymupdf.Rect(b[:4]) for b in page.get_text("blocks")]
+    for d in page.get_drawings():
+        rects.append(pymupdf.Rect(d["rect"]))
+    return rects
+
+
+def room_below(r, obstacles, limit: float) -> float:
+    """r の真下で、横方向に重なる最初の障害物の上端（無ければ limit）"""
+    bottom = limit
+    for o in obstacles:
+        if o.y0 >= r.y1 - 1 and min(o.x1, r.x1) - max(o.x0, r.x0) > 1:
+            bottom = min(bottom, o.y0 - 3)
+    return bottom
+
+
+def write_pdf(src_pdf: Path, out: Path, items, fonts: PdfFonts, dual: Path | None = None):
+    """元PDFの訳した段落だけを消し、同じ枠に訳文を流し込む。図・数式・訳さなかった段落はそのまま残す。
+    文字が枠に収まらなければ縮小して収める。dual を渡すと 原文｜訳文 の見開きPDFも作る"""
+    doc = pymupdf.open(src_pdf)
+    by_page = {}
+    for pno, p, dst in items:
+        if dst is not None and p.horizontal:  # 回転した文字（図の軸ラベルなど）は原文のまま
+            by_page.setdefault(pno, []).append((p, dst))
+
+    # 訳文を1段落1ページの作業用PDFに組む。page.insert_htmlbox を段落ごとに呼ぶと
+    # 日本語フォント（数 MB）が段落の数だけ埋め込まれるので、1つの DocumentWriter にまとめて
+    # フォントを共有させ、show_pdf_page で元のページへ貼る（同じ作業用PDFからの貼り付けはフォントを使い回す）
+    buf = io.BytesIO()
+    writer = pymupdf.DocumentWriter(buf)
+    css = "body{margin:1px}" + fonts.css
+    placed, shrunk = [], 0
+
+    def fit(story, r):
+        # 枠を広げて収まる倍率を探す（= 文字を縮める倍率の逆数）。長い単語も枠からはみ出させない
+        story.reset()
+        return story.fit_scale(pymupdf.Rect(0, 0, r.width, r.height), scale_min=1,
+                               flags=pymupdf.mupdf.FZ_PLACE_STORY_FLAG_NO_OVERFLOW)
+
+    for pno, paras in by_page.items():
+        page = doc[pno - 1]
+        obstacles = None
+        for p, dst in paras:
+            r = pymupdf.Rect(p.rect)
+            story = pymupdf.Story(html=fonts.html(p, dst), user_css=css, archive=fonts.archive)
+            f = fit(story, r)
+            if f.parameter > 1.02 and not page.rotation:
+                # 収まらないときは、下にある空き（次の段落・図・罫線まで）へ枠を伸ばして縮小を抑える
+                if obstacles is None:
+                    obstacles = page_obstacles(page)
+                bottom = room_below(r, obstacles, page.rect.height * 0.94)
+                if bottom > r.y1 + 1:
+                    r2 = pymupdf.Rect(r.x0, r.y0, r.x1, bottom)
+                    f2 = fit(story, r2)
+                    if f2.parameter < f.parameter:
+                        # 使った高さまで枠を縮める（文字の倍率は変えない）
+                        used = max(f2.filled[3] / f2.parameter, r.height)
+                        r = pymupdf.Rect(r.x0, r.y0, r.x1, min(r.y0 + used + 1, bottom))
+                        f = fit(story, r)
+            story.reset()
+            story.place(f.rect)
+            dev = writer.begin_page(f.rect)
+            story.draw(dev)
+            writer.end_page()
+            placed.append((pno, r))
+            if f.parameter > 1 / 0.75:
+                shrunk += 1
+    writer.close()
+    layer = pymupdf.open("pdf", buf.getvalue()) if placed else None
+
+    for pno, paras in by_page.items():
+        # 抽出した座標も注釈・show_pdf_page も回転前のページ座標なので、/Rotate 付きのページもそのまま扱える
+        page = doc[pno - 1]
+        for p, _ in paras:
+            page.add_redact_annot(pymupdf.Rect(p.rect), fill=False)
+        # 文字だけ消す。画像・線画（図・表の罫線・背景色）は残す
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+    for k, (pno, r) in enumerate(placed):
+        doc[pno - 1].show_pdf_page(r, layer, k)
+    doc.subset_fonts()  # 日本語フォントは数 MB あるので使った字だけ埋め込む
+    doc.save(out, garbage=3, deflate=True)
+    if shrunk:
+        print(f"  {shrunk} 段落は訳文が長く、文字を 75% 未満に縮めて収めました")
+    if dual:
+        tr = pymupdf.open(out)
+        src = pymupdf.open(src_pdf)
+        dd = pymupdf.open()
+        for i in range(len(src)):
+            r0, r1 = src[i].rect, tr[i].rect
+            page = dd.new_page(width=r0.width + r1.width, height=max(r0.height, r1.height))
+            page.show_pdf_page(pymupdf.Rect(0, 0, r0.width, r0.height), src, i)
+            page.show_pdf_page(pymupdf.Rect(r0.width, 0, r0.width + r1.width, r1.height), tr, i)
+        dd.save(dual, garbage=3, deflate=True)
 
 
 # ---------------------------------------------------------------- llama-server の用意
@@ -381,9 +610,38 @@ class Server:
 
 
 # ---------------------------------------------------------------- メイン
-def translate_pdf(pdf: Path, a, model_tag: str) -> Path:
-    out = pdf.with_suffix(".ja.html")
-    cache_path = pdf.with_suffix(".ja.cache.json")
+FORMATS = ("html", "pdf", "dual")
+
+
+def parse_formats(s: str) -> list[str]:
+    """--format の値（"html,pdf" / "all" など）を解釈する"""
+    fs = [f.strip().lower() for f in re.split(r"[,\s]+", s) if f.strip()]
+    if fs == ["all"]:
+        return list(FORMATS)
+    bad = [f for f in fs if f not in FORMATS]
+    if bad or not fs:
+        sys.exit(f"--format は {' / '.join(FORMATS)} をカンマ区切りで指定してください（all で全部）: {s}")
+    return fs
+
+
+def out_dir_for(pdf: Path, a) -> Path:
+    """出力先フォルダ。--out-dir（config.ini の out_dir）が空なら PDF と同じフォルダ"""
+    if not a.out_dir:
+        return pdf.resolve().parent
+    d = Path(os.path.expandvars(str(a.out_dir))).expanduser()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def translate_pdf(pdf: Path, a, model_tag: str, fonts: "PdfFonts | None") -> list[Path]:
+    formats = parse_formats(a.format)
+    base = out_dir_for(pdf, a) / f"{pdf.stem}.{a.to}"
+    outs = {"html": base.with_name(base.name + ".html"),
+            "pdf": base.with_name(base.name + ".pdf"),
+            "dual": base.with_name(base.name + ".dual.pdf")}
+    if pdf.resolve() in {p.resolve() for p in outs.values()}:
+        sys.exit(f"出力先が入力PDFと同じになります: {pdf}")
+    cache_path = base.with_name(base.name + ".cache.json")
     cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
 
     pages = extract_blocks(pdf, a.keep_refs)
@@ -391,13 +649,19 @@ def translate_pdf(pdf: Path, a, model_tag: str) -> Path:
     print(f"{pdf.name}: {len(pages)}ページ / {total}段落")
 
     tr = Translator(a.url, a.to, a.src or None, a.form, not a.no_context, a.timeout)
-    items, done, t0 = [], 0, time.time()
+    items, done, t0 = [], 0, time.time()  # items: (ページ番号, Para, 訳文 or None)
+    title = f"{pdf.stem}（{model_tag}）"
+
+    def save_html():
+        write_html(outs["html"], title, [(pno, p.text, dst) for pno, p, dst in items])
+
     try:
         for pno, paras in pages:
-            for text in paras:
+            for p in paras:
+                text = p.text
                 done += 1
-                if not should_translate(text):
-                    items.append((pno, text, None))
+                if p.table or not should_translate(text):
+                    items.append((pno, p, None))
                     continue
                 key = f"{model_tag}|{a.to}|{a.form}|{text}"  # モデル・訳先言語・文体が変わったら訳し直す
                 if key in cache:
@@ -407,14 +671,29 @@ def translate_pdf(pdf: Path, a, model_tag: str) -> Path:
                     dst = tr(text)
                     cache[key] = dst
                     cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-                items.append((pno, text, dst))
+                items.append((pno, p, dst))
                 el = time.time() - t0
                 print(f"\r  {done}/{total} 段落  経過 {el:5.0f} s", end="", flush=True)
-            write_html(out, f"{pdf.stem}（{model_tag}）", items)  # ページごとに途中保存
+            if "html" in formats:
+                save_html()  # ページごとに途中保存
     finally:
-        write_html(out, f"{pdf.stem}（{model_tag}）", items)
-        print(f"\n出力: {out}")
-    return out
+        # 中断したときも、そこまでの訳で出力する（PDF は訳していない段落が原文のまま残る）
+        print()
+        written = []
+        if "html" in formats:
+            save_html()
+            written.append(outs["html"])
+        if "pdf" in formats or "dual" in formats:
+            # 見開きだけ欲しいときは、置き換えPDFを作業用の名前で作って後で消す
+            rep = outs["pdf"] if "pdf" in formats else base.with_name(base.name + ".tmp.pdf")
+            write_pdf(pdf, rep, items, fonts or PdfFonts(a.pdf_font),
+                      outs["dual"] if "dual" in formats else None)
+            written += [outs[f] for f in ("pdf", "dual") if f in formats]
+            if rep != outs["pdf"]:
+                rep.unlink()
+        for o in written:
+            print(f"出力: {o}")
+    return written
 
 
 def install_llama_cpp(dest_root: Path = None) -> Path:
@@ -479,13 +758,138 @@ def setup(a):
     print("セットアップ完了")
 
 
+# ---------------------------------------------------------------- 設定ファイル（config.ini）
+CONFIG = Path(__file__).resolve().parent / "config.ini"
+CONFIG_SECTION = "plamo-pdf"
+CONFIG_TEMPLATE = f"""\
+; plamo-pdf の設定。コマンドラインで同じオプションを指定すると、そちらが優先される。
+; 行頭の ; はコメント。値を空にすると既定値になる。キーはオプション名（--out-dir → out_dir）。
+[{CONFIG_SECTION}]
+; 出力先フォルダ。空なら PDF と同じフォルダ。set_outdir.bat でフォルダを選んで設定できる
+;   例: out_dir = %USERPROFILE%\\Documents\\翻訳
+out_dir =
+; 出力形式（カンマ区切りで複数可。all で全部）
+;   html = 対訳HTML / pdf = 元のレイアウトのまま訳文に置き換えたPDF / dual = 原文｜訳文 の見開きPDF
+format = html,pdf
+; 日本語の文体: plain = である調 / polite = です・ます調
+form = plain
+; PDF に使う日本語フォントファイル。空なら BIZ UD明朝（見出しは BIZ UDゴシック）などを自動で探す
+pdf_font =
+"""
+
+
+def read_config_text() -> str:
+    raw = CONFIG.read_bytes()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp932")  # メモ帳で ANSI 保存された場合
+
+
+def load_config(ap: argparse.ArgumentParser):
+    """config.ini の値をオプションの既定値にする（コマンドラインの指定が優先）"""
+    if not CONFIG.exists():
+        return
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read_string(read_config_text())
+    except configparser.Error as e:
+        sys.exit(f"config.ini を読めません: {e}")
+    if not cp.has_section(CONFIG_SECTION):
+        return
+    acts = {}
+    for act in ap._actions:
+        if act.option_strings and act.dest not in ("help", "setup", "choose_out_dir"):
+            acts[act.dest] = act
+            for o in act.option_strings:
+                acts[o.lstrip("-").replace("-", "_")] = act
+    defaults = {}
+    for k, v in cp[CONFIG_SECTION].items():
+        act = acts.get(k.replace("-", "_"))
+        if act is None:
+            print(f"config.ini: 知らない設定 {k} は無視します", file=sys.stderr)
+            continue
+        v = v.strip()
+        if v == "":
+            continue
+        if isinstance(act, argparse._StoreTrueAction):
+            v = v.lower() in ("1", "true", "yes", "on")
+        elif act.type:
+            try:
+                v = act.type(v)
+            except ValueError:
+                sys.exit(f"config.ini: {k} の値が正しくありません: {v}")
+        if act.choices and v not in act.choices:
+            sys.exit(f"config.ini: {k} は {' / '.join(act.choices)} のどれかにしてください: {v}")
+        defaults[act.dest] = v
+    ap.set_defaults(**defaults)
+
+
+def set_config(key: str, value: str):
+    """config.ini の1項目を書き換える（コメントや他の項目はそのまま残す）"""
+    text = read_config_text() if CONFIG.exists() else CONFIG_TEMPLATE
+    pat = re.compile(rf"^[ \t]*{re.escape(key)}[ \t]*[=:].*$", re.M)
+    line = f"{key} = {value}"
+    if pat.search(text):
+        text = pat.sub(lambda m: line, text, count=1)
+    elif re.search(rf"^\[{re.escape(CONFIG_SECTION)}\]", text, re.M):
+        text = re.sub(rf"^(\[{re.escape(CONFIG_SECTION)}\][^\n]*\n)", lambda m: m.group(1) + line + "\n",
+                      text, count=1, flags=re.M)
+    else:
+        text = text.rstrip("\n") + f"\n[{CONFIG_SECTION}]\n{line}\n"
+    CONFIG.write_text(text, encoding="utf-8")
+
+
+def choose_out_dir(current: str | None):
+    """フォルダ選択ダイアログで出力先を選び、config.ini に保存する"""
+    print(f"現在の保存先: {current or 'PDF と同じフォルダ'}")
+    start = Path(os.path.expandvars(current)).expanduser() if current else Path.home() / "Documents"
+    d = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)  # ダイアログがコンソールの裏に隠れないように
+        d = filedialog.askdirectory(title="翻訳結果の保存先フォルダを選んでください",
+                                    initialdir=str(start if start.is_dir() else Path.home()), mustexist=False)
+        root.destroy()
+    except Exception:  # tkinter が無い・画面が無い環境では入力で受け付ける
+        d = input("保存先フォルダのパス（空 Enter でキャンセル）: ").strip().strip('"')
+    if not d:
+        ans = input("保存先を「PDF と同じフォルダ」に戻しますか？ [y/N]: ").strip().lower()
+        if ans in ("y", "yes"):
+            set_config("out_dir", "")
+            print(f"保存先: PDF と同じフォルダ（{CONFIG} に保存）")
+        else:
+            print("変更しませんでした")
+        return
+    d = str(Path(d))
+    set_config("out_dir", d)
+    print(f"保存先: {d}（{CONFIG} に保存）")
+
+
+def open_file(p: Path):
+    if hasattr(os, "startfile"):
+        os.startfile(p)  # 既定のアプリで開く（PDF は PDF ビューアー、HTML はブラウザ）
+    else:
+        import webbrowser
+        webbrowser.open(p.resolve().as_uri())
+
+
 def main():
     for s in (sys.stdout, sys.stderr):  # cp932 のコンソールで表示できない文字があっても落ちないように
         s.reconfigure(errors="replace")
-    ap = argparse.ArgumentParser(description="PLaMo 3 Translate で論文PDFを対訳HTMLにする")
+    ap = argparse.ArgumentParser(description="PLaMo 3 Translate で論文PDFを対訳HTML・日本語PDFにする")
     ap.add_argument("pdf", type=Path, nargs="*", help="翻訳するPDF（複数可）")
     ap.add_argument("--setup", action="store_true",
                     help="llama-server（無ければ自動で入れる）とモデルを用意して動作確認する")
+    ap.add_argument("--choose-out-dir", action="store_true",
+                    help="フォルダ選択画面で出力先を選び、config.ini に保存する")
+    ap.add_argument("-o", "--out-dir", default=None, help="出力先フォルダ（既定は PDF と同じフォルダ）")
+    ap.add_argument("--format", default="html,pdf",
+                    help="出力形式 html / pdf / dual をカンマ区切りで（all で全部。既定 html,pdf）")
+    ap.add_argument("--pdf-font", default=None, help="PDF に使う日本語フォントファイル（既定は自動）")
     ap.add_argument("--model", default=None,
                     help=f"使うモデル: {' / '.join(MODELS)} または .gguf のパス（既定 {DEFAULT_MODEL}）")
     ap.add_argument("--url", default="http://127.0.0.1:8000", help="llama-server のURL")
@@ -499,10 +903,17 @@ def main():
     ap.add_argument("--no-context", action="store_true", help="直前段落を文脈として渡さない")
     ap.add_argument("--keep-refs", action="store_true", help="参考文献も翻訳する")
     ap.add_argument("--timeout", type=int, default=600, help="1段落あたりのタイムアウト [s]")
-    ap.add_argument("--open", action="store_true", help="終わったら対訳HTMLをブラウザで開く")
+    ap.add_argument("--open", action="store_true", help="終わったら出力ファイルを開く")
+    load_config(ap)
     a = ap.parse_args()
 
+    if a.choose_out_dir:
+        choose_out_dir(a.out_dir)
+        return
     if a.setup:
+        if not CONFIG.exists():
+            CONFIG.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+            print(f"設定ファイルを作りました: {CONFIG}")
         setup(a)
         return
     if not a.pdf:
@@ -511,14 +922,17 @@ def main():
     for p in a.pdf:
         if not p.exists():
             sys.exit(f"ファイルがありません: {p}")
+    formats = parse_formats(a.format)  # サーバー起動前に書式の誤りを知らせる
+    fonts = PdfFonts(a.pdf_font) if {"pdf", "dual"} & set(formats) else None
+    if fonts:
+        print(f"PDF の日本語フォント: {fonts.name}")
 
     server = Server(a)
     try:
         for pdf in a.pdf:
-            out = translate_pdf(pdf, a, server.model)
-            if a.open:
-                import webbrowser
-                webbrowser.open(out.resolve().as_uri())
+            for out in translate_pdf(pdf, a, server.model, fonts):
+                if a.open:
+                    open_file(out)
     except KeyboardInterrupt:
         print("\n中断しました（再実行すると続きから訳します）")
     except urllib.error.URLError as e:
