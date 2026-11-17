@@ -90,6 +90,77 @@ class Para(NamedTuple):
     horizontal: bool  # すべての行が横書き（回転していない）か
     center: bool      # ページ中央にそろえた1〜2行のブロック（タイトルなど）か
     table: bool       # 表の行（同じ高さに4つ以上の行が横に並ぶ）か。訳さない
+    leading: float    # 元の行送り ÷ 文字サイズ（訳文もできるだけこの行間で組む）
+
+
+# 箇条書き・選択肢の行頭: "(A)" "(1)" "a)" "2." "•" など（後ろは空白か行末）
+LIST_MARK = re.compile(r"^\s*(?:\([A-Za-z0-9]{1,3}\)|[A-Za-z0-9]{1,3}[.)]|[•●▪◦‣\-–])(?=\s|$)")
+
+
+def line_text(line) -> str:
+    return "".join(s["text"] for s in line["spans"])
+
+
+def block_rows(lines):
+    """行を見た目の行（同じ高さに並ぶ行のまとまり）に分け、上から順に返す。各行は左から右へ"""
+    rows = []
+    for line in sorted(lines, key=lambda l: (l["bbox"][1], l["bbox"][0])):
+        a = line["bbox"]
+        for row in rows:
+            b = row["bbox"]
+            if min(a[3], b[3]) - max(a[1], b[1]) > 0.5 * min(a[3] - a[1], b[3] - b[1]):
+                row["lines"].append(line)
+                row["bbox"] = (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+                break
+        else:
+            rows.append({"lines": [line], "bbox": tuple(a)})
+    for row in rows:
+        row["lines"].sort(key=lambda l: l["bbox"][0])
+        row["text"] = " ".join(line_text(l).strip() for l in row["lines"])
+    return rows
+
+
+def split_block(d: dict, page_width: float):
+    """1つのテキストブロックを段落単位に分ける。
+    - 選択肢・箇条書き（"(A) ..." "2. ..." の行）は1項目ずつ
+    - "(1)" だけの行（段落番号）は、続く本文と分ける
+    - ページ中央にそろえた短い行だけのブロック（"TOEFL iBT Sample / Reading / Cougars" のような表題）は1行ずつ
+    MuPDF はこれらを1ブロックにまとめるので、そのままだと改行が消えて1文として訳され、配置も崩れる"""
+    if is_table_row(d["lines"]):
+        return [d]
+    rows = block_rows(d["lines"])
+    if len(rows) < 2:
+        return [d]
+    x0, _, x1, _ = d["bbox"]
+    width = x1 - x0
+    titles = len(rows) <= 4 and all(
+        abs((r["bbox"][0] + r["bbox"][2]) / 2 - page_width / 2) < page_width * 0.03
+        and r["bbox"][2] - r["bbox"][0] < page_width * 0.5 for r in rows)
+    segs = [[rows[0]]]
+    for prev, row in zip(rows, rows[1:]):
+        prev_text = prev["text"].strip()
+        mark_only = LIST_MARK.match(prev_text) and not LIST_MARK.sub("", prev_text).strip()
+        # 行頭記号の行で切るのは、前の行が文末で終わるか短いとき、または前の項目も行頭記号で始まるとき
+        # （本文の途中で行頭に来た "1." と区別する）
+        new_item = LIST_MARK.match(row["text"]) and (
+            re.search(r"[.?!:)\"”]$", prev_text) or prev["bbox"][2] - prev["bbox"][0] < width * 0.8
+            or LIST_MARK.match(segs[-1][0]["text"]))
+        if titles or mark_only or new_item:
+            segs.append([row])
+        else:
+            segs[-1].append(row)
+    if len(segs) == 1:
+        return [d]
+    out = []
+    for seg in segs:
+        lines = [l for r in seg for l in r["lines"]]
+        bb = (min(r["bbox"][0] for r in seg), min(r["bbox"][1] for r in seg),
+              max(r["bbox"][2] for r in seg), max(r["bbox"][3] for r in seg))
+        ids = {id(l) for l in lines}
+        # 文字は MuPDF の行の順のまま（行の並べ替えで分数の分子などの位置が変わらないように）
+        text = "\n".join(line_text(l) for l in d["lines"] if id(l) in ids)
+        out.append({"bbox": bb, "lines": lines, "text": text})
+    return out
 
 
 def is_table_row(lines) -> bool:
@@ -118,12 +189,22 @@ def block_style(d: dict, page_width: float):
             color[s["color"]] += n
             bold[bool(s["flags"] & 16) or "bold" in s["font"].lower()] += n
     if not size:
-        return 10.0, "#000000", False, horizontal, False, False
+        return 10.0, "#000000", False, horizontal, False, False, 1.25
     x0, _, x1, _ = d["bbox"]
-    center = (len(d["lines"]) <= 2 and abs((x0 + x1) / 2 - page_width / 2) < page_width * 0.02
-              and x1 - x0 < page_width * 0.8)
-    return (size.most_common(1)[0][0], f"#{color.most_common(1)[0][0]:06x}",
-            bold.most_common(1)[0][0], horizontal, center, is_table_row(d["lines"]))
+    rows = block_rows(d["lines"])
+    # 1〜2行の各行がページ中央にそろっている（2行段落の短い最終行は左寄りなので除かれる）
+    # 本文幅いっぱいの2行段落も各行が中央に来るので、行が短いか、行の幅がそろっていない（＝中央寄せ）ときだけ
+    widths = [r["bbox"][2] - r["bbox"][0] for r in rows]
+    center = (len(rows) <= 2 and x1 - x0 < page_width * 0.8 and all(
+        abs((r["bbox"][0] + r["bbox"][2]) / 2 - page_width / 2) < page_width * 0.02 for r in rows)
+        and (max(widths) < page_width * 0.55 or min(widths) < max(widths) * 0.9))
+    main_size = size.most_common(1)[0][0]
+    # 行送り = 隣り合う行の下端の間隔の中央値。1行だけなら行の高さから
+    steps = sorted(b["bbox"][3] - a["bbox"][3] for a, b in zip(rows, rows[1:]))
+    pitch = steps[len(steps) // 2] if steps else rows[0]["bbox"][3] - rows[0]["bbox"][1]
+    leading = min(max(pitch / main_size, 1.15), 2.2) if main_size else 1.25
+    return (main_size, f"#{color.most_common(1)[0][0]:06x}",
+            bold.most_common(1)[0][0], horizontal, center, is_table_row(d["lines"]), leading)
 
 
 def extract_blocks(pdf_path: Path, keep_refs: bool):
@@ -133,15 +214,31 @@ def extract_blocks(pdf_path: Path, keep_refs: bool):
     pages = []
     for page in doc:
         h, w = page.rect.height, page.rect.width
-        tp = page.get_textpage()  # 同じ TextPage から取ると blocks と dict のブロック番号が一致する
-        styles = {d["number"]: d for d in page.get_text("dict", textpage=tp)["blocks"] if d["type"] == 0}
-        blocks = []
-        for b, col in reading_order(page.get_text("blocks", textpage=tp), w):
-            if b[6] != 0:  # 画像ブロックは除外
+        # テキストブロックを段落（選択肢・表題の行など）に分け、blocks 形式のタプル
+        # (x0, y0, x1, y1, text, 番号, 0) にして読み順を決める。画像ブロックは除外
+        # 分けなかったブロックの文字は従来どおり blocks 形式から取る（同じ TextPage ならブロック番号が一致する）
+        tp = page.get_textpage()
+        block_text = {b[5]: b[4] for b in page.get_text("blocks", textpage=tp)}
+        segs, tuples = [], []
+        for d in page.get_text("dict", textpage=tp)["blocks"]:
+            if d["type"] != 0:
                 continue
+            # 空白だけの行（Word 由来の PDF に多い）で枠が上下に広がり、訳文の位置がずれるので除く
+            lines = [l for l in d.get("lines", []) if line_text(l).strip()]
+            if not lines:
+                continue
+            if len(lines) < len(d["lines"]):
+                d = dict(d, lines=lines, bbox=(min(l["bbox"][0] for l in lines), min(l["bbox"][1] for l in lines),
+                                               max(l["bbox"][2] for l in lines), max(l["bbox"][3] for l in lines)))
+            for s in split_block(d, w):
+                text = s["text"] + "\n" if "text" in s else block_text.get(d["number"], "")
+                tuples.append((*s["bbox"], text, len(segs), 0))
+                segs.append(s)
+        blocks = []
+        for b, col in reading_order(tuples, w):
             # ページ上下 8% にあるブロックはヘッダー・フッター候補
             edge = b[3] < h * 0.08 or b[1] > h * 0.92
-            style = block_style(styles.get(b[5], {}), w)
+            style = block_style(segs[b[5]], w)
             blocks.append((b[4], edge, b[1], col, (b[0], b[1], b[2], b[3]), style))
         pages.append(blocks)
 
@@ -194,9 +291,18 @@ def clean(t: str) -> str:
     return t.strip()
 
 
-def should_translate(text: str) -> bool:
-    """数式・数値表・短すぎる断片は訳さない"""
+def should_translate(text: str, short_ok: bool = False) -> bool:
+    """数式・数値表・短すぎる断片は訳さない。選択肢・箇条書き（"(A) clear"）と、
+    short_ok（中央そろえの表題 "Reading" など）は1語でも訳す"""
+    if re.fullmatch(r"\s*(\S+@\S+\.\S+|https?://\S+|www\.\S+)\s*", text):  # メールアドレス・URL
+        return False
     letters = sum(c.isalpha() for c in text)
+    if short_ok and letters >= 3 and letters / max(len(text), 1) >= 0.5:
+        return True
+    item = LIST_MARK.sub("", text, count=1) if LIST_MARK.match(text) else None
+    if item is not None and item.strip():
+        letters = sum(c.isalpha() for c in item)
+        return letters >= 3 and letters / max(len(item.strip()), 1) >= 0.5
     if letters < 8:
         return False
     if letters / max(len(text), 1) < 0.5:
@@ -352,10 +458,10 @@ class PdfFonts:
         self.css = "".join(css)
         self.name = body.name if body else "PyMuPDF 内蔵フォント"
 
-    def html(self, p: Para, text: str) -> str:
+    def html(self, p: Para, text: str, leading: float = 1.25) -> str:
         fam = "jbold" if p.bold and self.has_bold else "jbody" if self.has_body else None
         # 両端揃えは半角スペースだけを広げるので、和文では英単語の前後が大きく空く。左揃えにする
-        style = [f"font-size:{p.size:.2f}pt", f"color:{p.color}", "line-height:1.25", "margin:0",
+        style = [f"font-size:{p.size:.2f}pt", f"color:{p.color}", f"line-height:{leading:.2f}", "margin:0",
                  "text-align:" + ("center" if p.center else "left")]
         if fam:
             style.append(f"font-family:{fam}")
@@ -374,10 +480,28 @@ class PdfFonts:
 
 def page_obstacles(page) -> list:
     """訳文の枠を伸ばすときにぶつかってはいけないもの（元の文字ブロック・画像・線画）の矩形"""
-    rects = [pymupdf.Rect(b[:4]) for b in page.get_text("blocks")]
+    # ブロックではなく行単位で見る（1ブロックを選択肢・表題の行ごとに分けて訳すので、同じブロックの次の行も障害物）
+    rects = [pymupdf.Rect(l["bbox"]) for b in page.get_text("dict")["blocks"] if b["type"] == 0
+             for l in b["lines"]]
     for d in page.get_drawings():
         rects.append(pymupdf.Rect(d["rect"]))
     return rects
+
+
+def text_right_edge(page) -> float:
+    """本文の右端（横書きの行の右端の最大値）。無ければページ幅の 92%"""
+    xs = [l["bbox"][2] for b in page.get_text("dict")["blocks"] if b["type"] == 0
+          for l in b["lines"] if abs(l["dir"][0] - 1) < 1e-3 and line_text(l).strip()]
+    return max(xs) if xs else page.rect.width * 0.92
+
+
+def room_right(r, obstacles, limit: float) -> float:
+    """r の右で、縦方向に重なる最初の障害物の左端（無ければ limit）"""
+    right = limit
+    for o in obstacles:
+        if o.x0 >= r.x1 - 1 and min(o.y1, r.y1) - max(o.y0, r.y0) > 1:
+            right = min(right, o.x0 - 6)
+    return right
 
 
 def room_below(r, obstacles, limit: float) -> float:
@@ -417,8 +541,37 @@ def write_pdf(src_pdf: Path, out: Path, items, fonts: PdfFonts, dual: Path | Non
         obstacles = None
         for p, dst in paras:
             r = pymupdf.Rect(p.rect)
-            story = pymupdf.Story(html=fonts.html(p, dst), user_css=css, archive=fonts.archive)
+            if p.center:
+                # 中央そろえの表題は、訳文が長くなっても左右の余白まで広げて1行に収める
+                cx, pw = (r.x0 + r.x1) / 2, page.rect.width
+                half = max(r.width / 2, min(cx - pw * 0.08, pw * 0.92 - cx))
+                r = pymupdf.Rect(cx - half, r.y0, cx + half, r.y1)
+            # まず元の行送りで組み、収まらなければ行間を詰めてから（下へ伸ばす・縮める）
+            lead = p.leading
+            # 1行の枠は和文1行（文字サイズ×行送り）より低いことがあり、それだけで縮小されて
+            # 選択肢ごとに文字の大きさがばらつくので、少なくとも1行分の高さにする
+            # （ただし下の行には重ねない）
+            need = r.y0 + p.size * max(lead, 1.25) + 2
+            if need > r.y1:
+                if obstacles is None:
+                    obstacles = page_obstacles(page)
+                r.y1 = max(r.y1, min(need, room_below(r, obstacles, page.rect.height) + 3))
+            story = pymupdf.Story(html=fonts.html(p, dst, lead), user_css=css, archive=fonts.archive)
             f = fit(story, r)
+            if f.parameter > 1.02 and lead > 1.25:
+                lead = 1.25
+                story = pymupdf.Story(html=fonts.html(p, dst, lead), user_css=css, archive=fonts.archive)
+                f = fit(story, r)
+            if f.parameter > 1.02 and not page.rotation and not p.center and LIST_MARK.match(p.text):
+                # 選択肢・箇条書きは、右の空き（本文の右端まで）へ枠を伸ばして1行に収める
+                if obstacles is None:
+                    obstacles = page_obstacles(page)
+                right = room_right(r, obstacles, text_right_edge(page))
+                if right > r.x1 + 1:
+                    r2 = pymupdf.Rect(r.x0, r.y0, right, r.y1)
+                    f2 = fit(story, r2)
+                    if f2.parameter < f.parameter:
+                        r, f = r2, f2
             if f.parameter > 1.02 and not page.rotation:
                 # 収まらないときは、下にある空き（次の段落・図・罫線まで）へ枠を伸ばして縮小を抑える
                 if obstacles is None:
@@ -660,7 +813,7 @@ def translate_pdf(pdf: Path, a, model_tag: str, fonts: "PdfFonts | None") -> lis
             for p in paras:
                 text = p.text
                 done += 1
-                if p.table or not should_translate(text):
+                if p.table or not should_translate(text, short_ok=p.center and p.horizontal):
                     items.append((pno, p, None))
                     continue
                 key = f"{model_tag}|{a.to}|{a.form}|{text}"  # モデル・訳先言語・文体が変わったら訳し直す
