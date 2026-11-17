@@ -1,5 +1,7 @@
 @echo off
-rem Drag and drop PDF files onto this file to make bilingual HTML and open it.
+rem Drag and drop PDF files onto this file to translate them and open the results
+rem (bilingual HTML and a PDF with the original layout, by default).
+rem Output folder and formats are set in config.ini (set_outdir.bat chooses the folder).
 rem Run setup.bat once first. The model chosen there is read from model.txt.
 rem To change it, edit model.txt (8b or 0.8b) or run setup.bat again.
 setlocal
