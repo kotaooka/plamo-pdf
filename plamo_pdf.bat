@@ -1,7 +1,8 @@
 @echo off
-rem Drag and drop PDF files onto this file to translate them and open the results
-rem (bilingual HTML and a PDF with the original layout, by default).
-rem Output folder and formats are set in config.ini (set_outdir.bat chooses the folder).
+rem Drag and drop PDF files onto this file to translate them
+rem (bilingual HTML and a PDF with the original layout, by default). The PDF opens when done.
+rem Output folder, formats and which files to open are set in config.ini
+rem (set_outdir.bat chooses the folder).
 rem Run setup.bat once first. The model chosen there is read from model.txt.
 rem To change it, edit model.txt (8b or 0.8b) or run setup.bat again.
 setlocal
@@ -19,5 +20,5 @@ if "%~1"=="" (
   pause
   exit /b 1
 )
-"%~dp0.venv\Scripts\python.exe" "%~dp0plamo_pdf.py" --model %MODEL% --open %*
+"%~dp0.venv\Scripts\python.exe" "%~dp0plamo_pdf.py" --model %MODEL% %*
 pause

@@ -10,14 +10,15 @@ plamo_pdf.py — 論文PDFをローカルの PLaMo 3 Translate（llama-server）
 使い方（PowerShell）:
   python plamo_pdf.py paper.pdf                    # 8B で翻訳（サーバーとモデルは自動で用意）
   python plamo_pdf.py paper.pdf --model 0.8b       # 軽量モデル（VRAM 2 GB 程度で動く）
-  python plamo_pdf.py a.pdf b.pdf --form polite --open
-  python plamo_pdf.py paper.pdf -o D:\\翻訳 --format pdf,dual
-  → paper.ja.html（対訳）・paper.ja.pdf（レイアウト維持）・paper.ja.cache.json（途中再開用）ができる
-  出力先・出力形式などの既定値は config.ini で変えられる（python plamo_pdf.py --choose-out-dir）
+  python plamo_pdf.py a.pdf b.pdf --form polite --open html,pdf
+  python plamo_pdf.py paper.pdf -o D:\\翻訳 --format pdf,dual --open none
+  → paper.ja.html（対訳）・paper.ja.pdf（レイアウト維持）ができ、終わると paper.ja.pdf が開く
+  出力先・出力形式・終わったら開くファイルの既定値は config.ini で変えられる
 """
 
 import argparse
 import configparser
+import hashlib
 import html
 import io
 import json
@@ -777,6 +778,22 @@ def parse_formats(s: str) -> list[str]:
     return fs
 
 
+def parse_open(s: str | None) -> set[str]:
+    """--open の値（"pdf" / "html,pdf" / "none" / "all"）を解釈する。古い config.ini の true/false も受け付ける"""
+    v = (s or "").strip().lower()
+    if v in ("", "none", "no", "off", "false", "0"):
+        return set()
+    if v in ("yes", "on", "true", "1"):
+        return {"pdf"}
+    fs = {f for f in re.split(r"[,\s]+", v) if f}
+    if fs == {"all"}:
+        return set(FORMATS)
+    if not fs <= set(FORMATS):
+        sys.exit(f"--open（config.ini の open）は {' / '.join(FORMATS)} をカンマ区切りで、"
+                 f"または none を指定してください: {s}")
+    return fs
+
+
 def out_dir_for(pdf: Path, a) -> Path:
     """出力先フォルダ。--out-dir（config.ini の out_dir）が空なら PDF と同じフォルダ"""
     if not a.out_dir:
@@ -786,7 +803,20 @@ def out_dir_for(pdf: Path, a) -> Path:
     return d
 
 
-def translate_pdf(pdf: Path, a, model_tag: str, fonts: "PdfFonts | None") -> list[Path]:
+CACHE_DIR = MODELS_DIR / "cache"
+
+
+def cache_path_for(pdf: Path, to: str) -> Path:
+    """途中再開用の訳文キャッシュ。出力先を散らかさないよう %USERPROFILE%\\.cache\\plamo-pdf\\cache\\ に置く。
+    PDF の中身のハッシュで区別するので、PDF を移動・改名しても続きから訳せる"""
+    h = hashlib.sha1(pdf.read_bytes()).hexdigest()[:12]
+    stem = re.sub(r'[\\/:*?"<>|]', "_", pdf.stem)[:60]
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR / f"{stem}-{h}.{to}.json"
+
+
+def translate_pdf(pdf: Path, a, model_tag: str, fonts: "PdfFonts | None") -> list[tuple[str, Path]]:
+    """戻り値は書き出した (形式, パス) の列"""
     formats = parse_formats(a.format)
     base = out_dir_for(pdf, a) / f"{pdf.stem}.{a.to}"
     outs = {"html": base.with_name(base.name + ".html"),
@@ -794,8 +824,15 @@ def translate_pdf(pdf: Path, a, model_tag: str, fonts: "PdfFonts | None") -> lis
             "dual": base.with_name(base.name + ".dual.pdf")}
     if pdf.resolve() in {p.resolve() for p in outs.values()}:
         sys.exit(f"出力先が入力PDFと同じになります: {pdf}")
-    cache_path = base.with_name(base.name + ".cache.json")
-    cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+    cache_path = cache_path_for(pdf, a.to)
+    cache = {}
+    # 以前の版は出力先に *.ja.cache.json を作っていた。あれば読み込んで引き継ぐ
+    for c in (base.with_name(base.name + ".cache.json"), cache_path):
+        if c.exists():
+            try:
+                cache.update(json.loads(c.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                pass
 
     pages = extract_blocks(pdf, a.keep_refs)
     total = sum(len(p) for _, p in pages)
@@ -835,16 +872,16 @@ def translate_pdf(pdf: Path, a, model_tag: str, fonts: "PdfFonts | None") -> lis
         written = []
         if "html" in formats:
             save_html()
-            written.append(outs["html"])
+            written.append(("html", outs["html"]))
         if "pdf" in formats or "dual" in formats:
             # 見開きだけ欲しいときは、置き換えPDFを作業用の名前で作って後で消す
             rep = outs["pdf"] if "pdf" in formats else base.with_name(base.name + ".tmp.pdf")
             write_pdf(pdf, rep, items, fonts or PdfFonts(a.pdf_font),
                       outs["dual"] if "dual" in formats else None)
-            written += [outs[f] for f in ("pdf", "dual") if f in formats]
+            written += [(f, outs[f]) for f in ("pdf", "dual") if f in formats]
             if rep != outs["pdf"]:
                 rep.unlink()
-        for o in written:
+        for _, o in written:
             print(f"出力: {o}")
     return written
 
@@ -923,7 +960,12 @@ CONFIG_TEMPLATE = f"""\
 out_dir =
 ; 出力形式（カンマ区切りで複数可。all で全部）
 ;   html = 対訳HTML / pdf = 元のレイアウトのまま訳文に置き換えたPDF / dual = 原文｜訳文 の見開きPDF
+;   対訳HTMLが要らなければ format = pdf にする
 format = html,pdf
+; 終わったら開くファイル（カンマ区切りで複数可）。none なら何も開かない
+;   pdf = 既定の PDF ビューアーで開く / html = ブラウザで開く / dual = 見開きPDFを開く
+;   例: open = pdf,html（HTML もブラウザで開く）
+open = pdf
 ; 日本語の文体: plain = である調 / polite = です・ます調
 form = plain
 ; PDF に使う日本語フォントファイル。空なら BIZ UD明朝（見出しは BIZ UDゴシック）などを自動で探す
@@ -1056,17 +1098,24 @@ def main():
     ap.add_argument("--no-context", action="store_true", help="直前段落を文脈として渡さない")
     ap.add_argument("--keep-refs", action="store_true", help="参考文献も翻訳する")
     ap.add_argument("--timeout", type=int, default=600, help="1段落あたりのタイムアウト [s]")
-    ap.add_argument("--open", action="store_true", help="終わったら出力ファイルを開く")
+    ap.add_argument("--open", nargs="?", const="pdf", default="pdf", metavar="FORMATS",
+                    help="終わったら開くファイル html / pdf / dual（カンマ区切り）または none（既定 pdf）")
+    ap.add_argument("--no-open", dest="open", action="store_const", const="none", help="何も開かない")
+    if not CONFIG.exists():
+        # 設定ファイルのひな形を作っておく（出力形式・開くファイルなどを書き換えられるように）
+        try:
+            CONFIG.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+            print(f"設定ファイルを作りました: {CONFIG}")
+        except OSError:
+            pass
     load_config(ap)
     a = ap.parse_args()
+    open_formats = parse_open(a.open)
 
     if a.choose_out_dir:
         choose_out_dir(a.out_dir)
         return
     if a.setup:
-        if not CONFIG.exists():
-            CONFIG.write_text(CONFIG_TEMPLATE, encoding="utf-8")
-            print(f"設定ファイルを作りました: {CONFIG}")
         setup(a)
         return
     if not a.pdf:
@@ -1083,8 +1132,8 @@ def main():
     server = Server(a)
     try:
         for pdf in a.pdf:
-            for out in translate_pdf(pdf, a, server.model, fonts):
-                if a.open:
+            for fmt, out in translate_pdf(pdf, a, server.model, fonts):
+                if fmt in open_formats:
                     open_file(out)
     except KeyboardInterrupt:
         print("\n中断しました（再実行すると続きから訳します）")

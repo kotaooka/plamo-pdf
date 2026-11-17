@@ -10,7 +10,7 @@
 - 数式・数値だけの段落は原文のまま残す
 - 参考文献以降は既定で翻訳しない（見出しのない `[1] A. Author, ...` 形式も検出。`--keep-refs` で翻訳）
 - 直前段落を文脈として渡し、訳語のぶれを抑える
-- 中断しても再実行で続きから（`*.ja.cache.json`。モデルを変えると訳し直す）
+- 中断しても再実行で続きから（訳文は `%USERPROFILE%\.cache\plamo-pdf\cache\` に保存し、出力先には作らない。モデルを変えると訳し直す）
 - 出力HTMLはPCでは左右対訳、スマホでは訳文→原文の縦並び。原文の表示切替あり
 - **レイアウト維持PDF**：元PDFの本文だけを訳文に差し替える。図・表・数式・参考文献・ヘッダーは元のまま。原文｜訳文の見開きPDFも出せる
 - **出力先フォルダを変更できる**（`set_outdir.bat` でフォルダを選ぶ / `--out-dir`）
@@ -59,18 +59,18 @@ Windows 以外では `pip install -r requirements.txt` を実行し、llama.cpp 
 
 ### 2. 翻訳する
 
-**いちばん簡単な方法**：PDF を `plamo_pdf.bat` にドラッグ＆ドロップする（複数可）。終わると対訳HTMLとレイアウト維持PDFが開く。出力先は `set_outdir.bat` で、出力形式は `config.ini` の `format` で変えられる。モデルを変えるときは `model.txt` を `8b` か `0.8b` に書き換えるか、`setup.bat` をもう一度実行する。
+**いちばん簡単な方法**：PDF を `plamo_pdf.bat` にドラッグ＆ドロップする（複数可）。終わるとレイアウト維持PDFが開く。出力先は `set_outdir.bat` で、出力形式は `config.ini` の `format` で、終わったら開くファイルは `open` で変えられる（対訳HTMLを作らない・ブラウザでも開く、など）。モデルを変えるときは `model.txt` を `8b` か `0.8b` に書き換えるか、`setup.bat` をもう一度実行する。
 
 コマンドから使う場合：
 
 ```powershell
 python plamo_pdf.py paper.pdf                       # 8B・である調
 python plamo_pdf.py paper.pdf --model 0.8b          # 軽量モデル
-python plamo_pdf.py a.pdf b.pdf --form polite --open
+python plamo_pdf.py a.pdf b.pdf --form polite --open html,pdf   # HTML もブラウザで開く
 python plamo_pdf.py paper.pdf -o D:\翻訳 --format pdf,dual   # 保存先と出力形式を指定
 ```
 
-`paper.ja.html` と `paper.ja.pdf` が出力される。llama-server はこのスクリプトが起動し、終わったら止める。指定した URL で既に llama-server が動いていればそれを使う（`--model` と違うモデルが動いているときはエラーにする）。
+`paper.ja.html` と `paper.ja.pdf` が出力され、`paper.ja.pdf` が開く。llama-server はこのスクリプトが起動し、終わったら止める。指定した URL で既に llama-server が動いていればそれを使う（`--model` と違うモデルが動いているときはエラーにする）。
 
 ### 出力ファイル
 
@@ -80,7 +80,9 @@ python plamo_pdf.py paper.pdf -o D:\翻訳 --format pdf,dual   # 保存先と出
 | `pdf` | `paper.ja.pdf` | 元のレイアウトのまま、本文を訳文に置き換えたPDF |
 | `dual` | `paper.ja.dual.pdf` | 左に原文ページ、右に置き換えたページを並べた見開きPDF |
 
-既定は `html,pdf`。カンマ区切りで組み合わせる（`all` で3つとも）。途中再開用の `paper.ja.cache.json` も同じフォルダにできる。形式を変えても翻訳はキャッシュから再利用するので、`--format` だけ変えて再実行すれば訳し直さずに作れる。
+既定は `html,pdf`。カンマ区切りで組み合わせる（`all` で3つとも）。対訳HTMLが要らなければ `pdf` にする。
+
+訳文は途中再開用に `%USERPROFILE%\.cache\plamo-pdf\cache\` に保存する（PDF の中身で区別するので、PDF を移動・改名しても使える）。形式を変えても翻訳はここから再利用するので、`--format` だけ変えて再実行すれば訳し直さずに作れる。以前の版が出力先に作った `*.ja.cache.json` は、あれば読み込んで引き継ぐ（不要なら消してよい）。
 
 #### レイアウト維持PDFのしくみ
 
@@ -101,7 +103,7 @@ python plamo_pdf.py paper.pdf -o D:\翻訳 --format pdf,dual   # 保存先と出
 
 ### 設定ファイル（config.ini）
 
-`plamo_pdf.py` と同じフォルダの `config.ini` に書いた値がオプションの既定値になる（コマンドラインの指定が優先）。`setup.bat` か `set_outdir.bat` を実行すると、説明付きのひな形ができる。キーはオプション名から `--` を除き、`-` を `_` にしたもの。
+`plamo_pdf.py` と同じフォルダの `config.ini` に書いた値がオプションの既定値になる（コマンドラインの指定が優先）。初めて実行したとき（`setup.bat` / `set_outdir.bat` / 翻訳）に、説明付きのひな形ができる。キーはオプション名から `--` を除き、`-` を `_` にしたもの。
 
 ```ini
 [plamo-pdf]
@@ -109,6 +111,8 @@ out_dir = %USERPROFILE%\Documents\翻訳
 format = html,pdf,dual
 form = polite
 pdf_font =
+; 終わったら開くファイル（pdf / html / dual をカンマ区切り。none で何も開かない）
+open = pdf,html
 ```
 
 ### オプション
@@ -127,7 +131,8 @@ pdf_font =
 | `--no-context` | なし | 直前段落を文脈として渡さない |
 | `--keep-refs` | なし | 参考文献も翻訳する |
 | `--timeout` | `600` | 1段落あたりのタイムアウト [s] |
-| `--open` | なし | 終わったら出力ファイルを開く（PDF は既定の PDF ビューアー） |
+| `--open` | `pdf` | 終わったら開くファイル `pdf` / `html` / `dual`（カンマ区切り）。`none` で何も開かない。PDF は既定の PDF ビューアー、HTML はブラウザで開く |
+| `--no-open` | なし | 何も開かない（`--open none` と同じ） |
 | `-o`, `--out-dir` | PDF と同じフォルダ | 出力先フォルダ（無ければ作る） |
 | `--format` | `html,pdf` | 出力形式 `html` / `pdf` / `dual`（カンマ区切り、`all` で全部） |
 | `--pdf-font` | 自動 | レイアウト維持PDFに使う日本語フォントファイル |
